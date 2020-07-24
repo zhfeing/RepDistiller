@@ -1,153 +1,257 @@
-"""
-get data loaders
-"""
-from __future__ import print_function
-
 import os
-import socket
-import numpy as np
-from torch.utils.data import DataLoader
-from torchvision import datasets
+import shutil
+from typing import Optional, Dict, Tuple
+import tqdm
+
+import torch
+from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.datasets.utils import check_integrity, verify_str_arg
+from torchvision.datasets.folder import default_loader, IMG_EXTENSIONS
+from torchvision.datasets.folder import has_file_allowed_extension
+
+META_FILE = "meta.bin"
 
 
-def get_data_folder():
-    """
-    return server-dependent path to store the data
-    """
-    hostname = socket.gethostname()
-    if hostname.startswith('visiongpu'):
-        data_folder = '/data/vision/phillipi/rep-learn/datasets/imagenet'
-    elif hostname.startswith('yonglong-home'):
-        data_folder = '/home/yonglong/Data/data/imagenet'
-    else:
-        data_folder = './data/imagenet'
+class ImageNet(Dataset):
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        num_image_per_class: int = None,
+        disable_parse_val: bool = False,
+        transform=None,
+        target_transform=None
+    ):
+        root = self.root = os.path.expanduser(root)
+        self.split = verify_str_arg(split, "split", ("train", "val"))
 
-    if not os.path.isdir(data_folder):
-        os.makedirs(data_folder)
+        self.disable_parse_val = disable_parse_val
+        print("parsing archives...")
+        self.parse_archives()
+        wnid_to_classes = load_meta_file(self.root)[0]
 
-    return data_folder
+        # start image folder {
+        classes, class_to_idx = self._find_classes(self.split_folder)
+        samples = make_dataset(
+            directory=self.split_folder,
+            class_to_idx=class_to_idx,
+            num_image_per_class=num_image_per_class,
+            extensions=IMG_EXTENSIONS
+        )
+        if len(samples) == 0:
+            raise (RuntimeError("Found 0 files in subfolders of: " + self.split_folder + "\n"
+                                "Supported extensions are: " + ",".join(IMG_EXTENSIONS)))
 
+        self.loader = default_loader
 
-class ImageFolderInstance(datasets.ImageFolder):
-    """: Folder datasets which returns the index of the image as well::
-    """
+        self.classes = classes
+        self.class_to_idx = class_to_idx
+        self.samples = samples
+        # }
+
+        self.wnids = self.classes
+        self.wnid_to_idx = self.class_to_idx
+        self.classes = [wnid_to_classes[wnid] for wnid in self.wnids]
+        self.class_to_idx = {cls: idx
+                             for idx, clss in enumerate(self.classes)
+                             for cls in clss}
+
+        self.transform = transform
+        self.target_transform = target_transform
+
+    def parse_archives(self):
+        if not check_integrity(os.path.join(self.root, META_FILE)):
+            print("creating meta file...")
+            parse_devkit_archive(self.root)
+        print("parsing val archive...")
+        parse_val_archive(self.root, disable=self.disable_parse_val)
+
+    @property
+    def split_folder(self):
+        folder_map = dict(
+            train="train_set",
+            val="val_set"
+        )
+        return os.path.join(self.root, folder_map[self.split])
+
+    def extra_repr(self):
+        return "Split: {split}".format(**self.__dict__)
+
+    def _find_classes(self, dir):
+        """
+        Finds the class folders in a dataset.
+
+        Args:
+            dir (string): Root directory path.
+
+        Returns:
+            tuple: (classes, class_to_idx) where classes are relative to (dir), and class_to_idx is a dictionary.
+
+        Ensures:
+            No class is a subdirectory of another.
+        """
+        classes = [d.name for d in os.scandir(dir) if d.is_dir()]
+        classes.sort()
+        class_to_idx = {classes[i]: i for i in range(len(classes))}
+        return classes, class_to_idx
+
     def __getitem__(self, index):
         """
         Args:
             index (int): Index
+
         Returns:
-            tuple: (image, target) where target is class_index of the target class.
+            tuple: (sample, target) where target is class_index of the target class.
         """
-        path, target = self.imgs[index]
-        img = self.loader(path)
+        path, target = self.samples[index]
+        sample = self.loader(path)
         if self.transform is not None:
-            img = self.transform(img)
+            sample = self.transform(sample)
         if self.target_transform is not None:
             target = self.target_transform(target)
 
-        return img, target, index
+        return sample, target
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __repr__(self):
+        head = "Dataset " + self.__class__.__name__
+        body = ["Number of datapoints: {}".format(self.__len__())]
+        if self.root is not None:
+            body.append("Root location: {}".format(self.root))
+        body += self.extra_repr().splitlines()
+        if hasattr(self, "transforms") and self.transforms is not None:
+            body += [repr(self.transforms)]
+        lines = [head] + [" " * self._repr_indent + line for line in body]
+        return '\n'.join(lines)
+
+    def _format_transform_repr(self, transform, head):
+        lines = transform.__repr__().splitlines()
+        return (["{}{}".format(head, lines[0])] +
+                ["{}{}".format(" " * len(head), line) for line in lines[1:]])
 
 
-class ImageFolderSample(datasets.ImageFolder):
-    """: Folder datasets which returns (img, label, index, contrast_index):
+def load_meta_file(root, file=None):
+    if file is None:
+        file = META_FILE
+    file = os.path.join(root, file)
+
+    if check_integrity(file):
+        return torch.load(file)
+    else:
+        msg = ("The meta file {} is not present in the root directory or is corrupted. "
+               "This file is automatically created by the ImageNet dataset.")
+        raise RuntimeError(msg.format(file, root))
+
+
+def _verify_archive(root, file, md5):
+    if not check_integrity(os.path.join(root, file), md5):
+        msg = ("The archive {} is not present in the root directory or is corrupted. "
+               "You need to download it externally and place it in {}.")
+        raise RuntimeError(msg.format(file, root))
+
+
+def parse_devkit_archive(root):
+    """Parse the devkit archive of the ImageNet2012 classification dataset and save
+    the meta information in a binary file.
+
+    Args:
+        root (str): Root directory containing the devkit archive
     """
-    def __init__(self, root, transform=None, target_transform=None,
-                 is_sample=False, k=4096):
-        super().__init__(root=root, transform=transform, target_transform=target_transform)
+    import scipy.io as sio
 
-        self.k = k
-        self.is_sample = is_sample
+    def parse_meta_mat(devkit_root):
+        metafile = os.path.join(devkit_root, "data", "meta.mat")
+        meta = sio.loadmat(metafile, squeeze_me=True)["synsets"]
+        nums_children = list(zip(*meta))[4]
+        meta = [meta[idx] for idx, num_children in enumerate(nums_children)
+                if num_children == 0]
+        idcs, wnids, classes = list(zip(*meta))[:3]
+        classes = [tuple(clss.split(", ")) for clss in classes]
+        idx_to_wnid = {idx: wnid for idx, wnid in zip(idcs, wnids)}
+        wnid_to_classes = {wnid: clss for wnid, clss in zip(wnids, classes)}
+        return idx_to_wnid, wnid_to_classes
 
-        print('stage1 finished!')
+    def parse_val_groundtruth_txt(devkit_root):
+        file = os.path.join(
+            devkit_root, "data", "ILSVRC2012_validation_ground_truth.txt")
+        with open(file, "r") as txtfh:
+            val_idcs = txtfh.readlines()
+        return [int(val_idx) for val_idx in val_idcs]
 
-        if self.is_sample:
-            num_classes = len(self.classes)
-            num_samples = len(self.samples)
-            label = np.zeros(num_samples, dtype=np.int32)
-            for i in range(num_samples):
-                path, target = self.imgs[i]
-                label[i] = target
+    if not os.path.isfile(os.path.join(root, META_FILE)):
+        devkit_root = os.path.join(root, "devkit")
+        idx_to_wnid, wnid_to_classes = parse_meta_mat(devkit_root)
+        val_idcs = parse_val_groundtruth_txt(devkit_root)
+        val_wnids = [idx_to_wnid[idx] for idx in val_idcs]
 
-            self.cls_positive = [[] for i in range(num_classes)]
-            for i in range(num_samples):
-                self.cls_positive[label[i]].append(i)
-
-            self.cls_negative = [[] for i in range(num_classes)]
-            for i in range(num_classes):
-                for j in range(num_classes):
-                    if j == i:
-                        continue
-                    self.cls_negative[i].extend(self.cls_positive[j])
-
-            self.cls_positive = [np.asarray(self.cls_positive[i], dtype=np.int32) for i in range(num_classes)]
-            self.cls_negative = [np.asarray(self.cls_negative[i], dtype=np.int32) for i in range(num_classes)]
-
-        print('dataset initialized!')
-
-    def __getitem__(self, index):
-        """
-        Args:
-            index (int): Index
-        Returns:
-            tuple: (image, target) where target is class_index of the target class.
-        """
-        path, target = self.imgs[index]
-        img = self.loader(path)
-        if self.transform is not None:
-            img = self.transform(img)
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-
-        if self.is_sample:
-            # sample contrastive examples
-            pos_idx = index
-            neg_idx = np.random.choice(self.cls_negative[target], self.k, replace=True)
-            sample_idx = np.hstack((np.asarray([pos_idx]), neg_idx))
-            return img, target, index, sample_idx
-        else:
-            return img, target, index
+        torch.save((wnid_to_classes, val_wnids), os.path.join(root, META_FILE))
 
 
-def get_test_loader(dataset='imagenet', batch_size=128, num_workers=8):
-    """get the test data loader"""
+def parse_val_archive(root, wnids=None, folder="val_set", disable=False):
+    """Parse the validation images archive of the ImageNet2012 classification dataset
+    and prepare it for usage with the ImageNet dataset.
 
-    if dataset == 'imagenet':
-        data_folder = get_data_folder()
-    else:
-        raise NotImplementedError('dataset not supported: {}'.format(dataset))
+    Args:
+        root (str): Root directory containing the validation images archive
+        wnids (list, optional): List of WordNet IDs of the validation images. If None
+            is given, the IDs are loaded from the meta file in the root directory
+        folder (str, optional): Optional name for validation images folder. Defaults to
+            "val"
+    """
+    if disable:
+        return
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    test_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    val_root = os.path.join(root, folder)
+    images = sorted([os.path.join(val_root, image) for image in os.listdir(val_root)])
 
-    test_folder = os.path.join(data_folder, 'val')
-    test_set = datasets.ImageFolder(test_folder, transform=test_transform)
-    test_loader = DataLoader(test_set,
-                             batch_size=batch_size,
-                             shuffle=False,
-                             num_workers=num_workers,
-                             pin_memory=True)
+    if wnids is None:
+        wnids = load_meta_file(root)[1]
 
-    return test_loader
+    for wnid in set(wnids):
+        new_dir = os.path.join(val_root, wnid)
+        if not os.path.isdir(new_dir):
+            os.mkdir(new_dir)
+
+    for wnid, img_file in tqdm.tqdm(zip(wnids, images)):
+        if os.path.isfile(img_file):
+            shutil.move(img_file, os.path.join(val_root, wnid, os.path.basename(img_file)))
 
 
-def get_dataloader_sample(dataset='imagenet', batch_size=128, num_workers=8, is_sample=False, k=4096):
-    """Data Loader for ImageNet"""
+def make_dataset(
+    directory: str,
+    class_to_idx: Dict[str, int],
+    num_image_per_class: int,
+    extensions: Tuple[str] = None,
+    is_valid_file: Optional[bool] = None,
+):
+    instances = []
+    directory = os.path.expanduser(directory)
+    both_none = extensions is None and is_valid_file is None
+    both_something = extensions is not None and is_valid_file is not None
+    if both_none or both_something:
+        raise ValueError("Both extensions and is_valid_file cannot be None or not None at the same time")
+    if extensions is not None:
+        def is_valid_file(x):
+            return has_file_allowed_extension(x, extensions)
+    for target_class in sorted(class_to_idx.keys()):
+        class_index = class_to_idx[target_class]
+        target_dir = os.path.join(directory, target_class)
+        if not os.path.isdir(target_dir):
+            continue
+        for root, _, fnames in sorted(os.walk(target_dir, followlinks=True)):
+            for fname in sorted(fnames)[:num_image_per_class]:
+                path = os.path.join(root, fname)
+                if is_valid_file(path):
+                    item = path, class_index
+                    instances.append(item)
+    return instances
 
-    if dataset == 'imagenet':
-        data_folder = get_data_folder()
-    else:
-        raise NotImplementedError('dataset not supported: {}'.format(dataset))
 
-    # add data transform
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+def get_imagenet(root: str, split: str = "train", num_image_per_class: int = None) -> Dataset:
+    normalize = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
@@ -160,77 +264,11 @@ def get_dataloader_sample(dataset='imagenet', batch_size=128, num_workers=8, is_
         transforms.ToTensor(),
         normalize,
     ])
-    train_folder = os.path.join(data_folder, 'train')
-    test_folder = os.path.join(data_folder, 'val')
 
-    train_set = ImageFolderSample(train_folder, transform=train_transform, is_sample=is_sample, k=k)
-    test_set = datasets.ImageFolder(test_folder, transform=test_transform)
-
-    train_loader = DataLoader(train_set,
-                              batch_size=batch_size,
-                              shuffle=True,
-                              num_workers=num_workers,
-                              pin_memory=True)
-    test_loader = DataLoader(test_set,
-                             batch_size=batch_size,
-                             shuffle=False,
-                             num_workers=num_workers,
-                             pin_memory=True)
-
-    print('num_samples', len(train_set.samples))
-    print('num_class', len(train_set.classes))
-
-    return train_loader, test_loader, len(train_set), len(train_set.classes)
-
-
-def get_imagenet_dataloader(dataset='imagenet', batch_size=128, num_workers=16, is_instance=False):
-    """
-    Data Loader for imagenet
-    """
-    if dataset == 'imagenet':
-        data_folder = get_data_folder()
+    if split == "train":
+        transform = train_transform
     else:
-        raise NotImplementedError('dataset not supported: {}'.format(dataset))
+        transform = test_transform
+    dataset = ImageNet(root, split=split, transform=transform, num_image_per_class=num_image_per_class)
+    return dataset
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize,
-    ])
-    test_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    train_folder = os.path.join(data_folder, 'train')
-    test_folder = os.path.join(data_folder, 'val')
-
-    if is_instance:
-        train_set = ImageFolderInstance(train_folder, transform=train_transform)
-        n_data = len(train_set)
-    else:
-        train_set = datasets.ImageFolder(train_folder, transform=train_transform)
-
-    test_set = datasets.ImageFolder(test_folder, transform=test_transform)
-
-    train_loader = DataLoader(train_set,
-                              batch_size=batch_size,
-                              shuffle=True,
-                              num_workers=num_workers,
-                              pin_memory=True)
-
-    test_loader = DataLoader(test_set,
-                             batch_size=batch_size,
-                             shuffle=False,
-                             num_workers=num_workers//2,
-                             pin_memory=True)
-
-    if is_instance:
-        return train_loader, test_loader, n_data
-    else:
-        return train_loader, test_loader

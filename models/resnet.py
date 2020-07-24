@@ -1,5 +1,3 @@
-from __future__ import absolute_import
-
 '''Resnet for cifar dataset.
 Ported form
 https://github.com/facebook/fb.resnet.torch
@@ -9,10 +7,6 @@ https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
 '''
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
-
-__all__ = ['resnet']
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -101,7 +95,6 @@ class Bottleneck(nn.Module):
 
 
 class ResNet(nn.Module):
-
     def __init__(self, depth, num_filters, block_name='BasicBlock', num_classes=10):
         super(ResNet, self).__init__()
         # Model type specifies number of layers for CIFAR-10 model
@@ -147,7 +140,7 @@ class ResNet(nn.Module):
         layers.append(block(self.inplanes, planes, stride, downsample, is_last=(blocks == 1)))
         self.inplanes = planes * block.expansion
         for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes, is_last=(i == blocks-1)))
+            layers.append(block(self.inplanes, planes, is_last=(i == blocks - 1)))
 
         return nn.Sequential(*layers)
 
